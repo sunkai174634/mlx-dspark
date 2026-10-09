@@ -1,36 +1,39 @@
-# mlx-dspark vision support (feat/vision-support branch)
+# Stage 2 progress — mrope injection path (2026-10-09)
 
-## 目标
+## 已验证积木 (4/5)
 
-让 `mlx-dspark serve` 单端口同时支持文本(草稿加速)和图像(orca视觉塔)请求。
+1. **VisionEmbedBypass** (embed旁路) ✓ — cumsum-gather, 逻辑测试过
+2. **processor编码** ✓ — 4680块 → 1170 pads
+3. **vision_tower侧载** ✓ — mx.load直接读分片1 + VisionModel.sanitize
+   + load_weights(strict=False) 全命中; 前向输出 (1170, 5120) float32
+4. **get_rope_index** ✓ — LanguageModel.get_rope_index 可用 FakeSelf(config)
+   独立调用; 输出 (3,1,1181): 文本段三行相同 / pad段三行不同(t/h/w) /
+   尾部回同步; rope_deltas=-1125 供后续 decode 段接续
 
-## 方案 (最小侵入)
+## 第5块: rope应用 (当前)
 
-```
-server._chat 检测 image_url
-  → mlx-vlm processor 编码图片 → vision_tower 前向 → image_embeds (N×hidden)
-  → prompt 构造: "<|vision_start|>" + <|image_pad|>×N + "<|vision_end|>" + text
-     (tokenizer.encode 能正确把字面特殊token转成 248053/248056/248054 — 已验证)
-  → prompt_ids 传入 Engine.generate 前, 把 image_embeds 挂到 target 的包装 embed 上
-  → 图像请求强制走 baseline 路径(无草稿) — 避免碰 verify 循环(lossless 红线)
-     文本请求照旧 dspark 30 tok/s
-```
+- dspark 路径的 FA attention = mlx-lm qwen3_next.Qwen3NextAttention,
+  其 rope = standard nn.RoPE, 调用 `self.rope(q, offset=cache.offset)` 标量
+- mlx-lm rope_utils 的 "mrope" 分支实际返回普通 RoPE (纯文本下三行相同,
+  退化正确; 图像下错)
+- `mx.fast.rope` 不支持 per-token offset (只接受标量/1元素向量) — 实测
+- **mlx-vlm 有完整可复用的 MRoPERotaryEmbedding** (rope_utils.py:1158):
+  - `__call__(x, position_ids) -> cos, sin`
+  - `apply_rotary(q, k, position_ids)` — 含 Metal fused 编译路径
+  - style="interleaved" 与 Qwen3_5 匹配
 
-## 关键验证记录
+## 注入设计 (最小侵入)
 
-- orca 特殊 token: `<|vision_start|>`=248053 `<|image_pad|>`=248056 `<|vision_end|>`=248054
-- 字面特殊 token 字符串经 `tok.encode()` 正确转 id ✓
-- `apply_chat_template` 接受含特殊 token 字面量的 str content ✓ (返回 str 再 encode)
-- Engine.generate → _generate_impl_inner → (mode 分支) 全部最终走 target.embed_tokens
+包装 mlx-lm Attention 的 rope 调用:
+- 平时(文本/decode): 原 nn.RoPE(offset=cache.offset) — 不动
+- 图像 prefill: arm 状态下换成 MRoPE.apply_rotary(q, k, pos_ids_3row)
+  + rope_deltas 接续 (decode 段位置 = arange + delta, 三行同步 →
+  可继续用原 rope(offset=offset+delta), 零持续开销!)
 
-## 改动点
+关键: decode/verify 段位置三行同步 → 不需要动草稿路径 (lossless 保全)
 
-1. `src/mlx_dspark/server.py::_chat` — 图像拦截分支 (~80 行)
-2. `src/mlx_dspark/server.py::Engine` — `_vision_embeds` 挂载点 + baseline 强制 (~20 行)
-3. `src/mlx_dspark/target.py` — embed_tokens 包装: image_pad id → 挂载表按序取 (~30 行)
+## 下一步
 
-## 风险
-
-- 作者在 load.py 警告过 vlm 路线的内存损坏前科 (gemma-4, verify buffer 垃圾) — 
-  我们绕开 verify (baseline-only) 规避
-- 上游升级需 rebase — 记录在 CHANGELOG
+1. 写 AttentionRopeWrapper + 单元测试 (arm 后 mrope, disarm 原样)
+2. server._chat 图像分支完整接线
+3. 小图端到端 → 与 qfast-vlm(:8190) 输出对比数值一致性
