@@ -49,6 +49,7 @@ from .generate import (
 )
 from .load import apply_wired_limit, load_dflash, load_drafter, load_target, resolve_mode
 from .lookup import lookup_generate
+from .vision_stack import arm_messages, arm_request, disarm_request
 from .prefix_cache import PrefixCache, _lcp, target_cache_reusable
 from .roofline import (
     REFERENCE_BANDWIDTH_GB_S,
@@ -376,6 +377,17 @@ class Engine:
         # Qwen3.8-27B-4bit — NOTES "Long-context decode").
         self._depth_capper = depth_capper
         self._last_cap = max_draft_tokens                  # effective cap of the last request
+        self._mrope = None
+        self.vision = None
+        try:
+            # Lazily wired by server.create_app() for multimodal checkpoints.
+            from .vision_stack import attach as attach_vision
+            self.vision = attach_vision(self.target, self.target_repo)
+        except Exception as exc:
+            # Text-only serving must remain available if optional vision wiring
+            # is incompatible with a target checkpoint.
+            print(f"[serve] vision wiring unavailable: {exc}", file=sys.stderr, flush=True)
+
         self.sampling_defaults = dict(sampling_defaults or {})
         self.default_max_tokens = default_max_tokens
         self.max_tokens_cap = max_tokens_cap
@@ -877,11 +889,13 @@ class Engine:
         stop: list[str] | None,
         seed: int | None,
         on_text=None,
+        force_baseline: bool = False,
     ) -> GenResult:
         # hop onto the single generation thread (keeps all MLX/cache work same-thread)
         return self._executor.submit(
             self._generate_impl, prompt_ids, max_tokens, temperature, top_p, top_k,
-            stop, seed, on_text, presence_penalty, frequency_penalty, logprobs).result()
+            stop, seed, on_text, presence_penalty, frequency_penalty, logprobs,
+            force_baseline).result()
 
     def _with_slow_round_log(self, inner, n_prompt: int):
         """Wrap a per-round callback with a stall detector: any gap over
@@ -906,18 +920,23 @@ class Engine:
 
         return wrapped
 
-    def _generate_impl(self, *args, **kwargs) -> GenResult:
+    def _generate_impl(self, prompt_ids, max_tokens, temperature, top_p, top_k,
+                       stop, seed, on_text, presence_penalty=0.0,
+                       frequency_penalty=0.0, logprobs=None, force_baseline=False):
         # `_busy` is what the memory guard reads to decide "shed now" vs "wait for a round
         # boundary"; it brackets every path that generates (requests, batch rows, warmup).
         self._busy = True
         try:
-            return self._generate_impl_inner(*args, **kwargs)
+            return self._generate_impl_inner(
+                prompt_ids, max_tokens, temperature, top_p, top_k, stop, seed,
+                on_text, presence_penalty, frequency_penalty, logprobs,
+                force_baseline=force_baseline)
         finally:
             self._busy = False
 
     def _generate_impl_inner(self, prompt_ids, max_tokens, temperature, top_p, top_k, stop,
                              seed, on_text, presence_penalty=0.0, frequency_penalty=0.0,
-                             logprobs=None) -> GenResult:
+                             logprobs=None, force_baseline=False) -> GenResult:
         recorder = RoundRecorder(self.rounds, uuid.uuid4().hex[:8], self.mode)
         on_round = self._with_slow_round_log(recorder, len(prompt_ids))
         # Per-request facts for spec_info: TTFT (first streamed text, engine-side — the
@@ -998,8 +1017,24 @@ class Engine:
             _progress_seen[0] = True
             self.rounds.publish({"type": "prefill", "req": _req, "mode": self.mode,
                                  "processed": int(pos), "total": _total})
+        def disarm_vision():
+            if force_baseline and self.vision is not None:
+                disarm_request(self.vision)
+
         try:
-            if self.mode == "dspark":
+            if force_baseline or self.mode == "baseline":
+                res = greedy_generate(
+                    self.target, self.tokenizer, prompt_ids=prompt_ids,
+                    cache=cache, reuse_len=reuse_len,
+                    max_new_tokens=max_tokens, temperature=temperature, top_p=top_p,
+                    top_k=top_k, presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty, logprobs=logprobs, seed=seed,
+                    stop=stop, on_text=on_text, on_round=on_round,
+                    on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    on_prefill_chunk=on_prefill_chunk,
+                    on_prefill_done=disarm_vision,
+                )
+            elif self.mode == "dspark":
                 res = speculative_generate(
                     self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
                     cache=cache, ctx_caches=ctx, reuse_len=reuse_len,
@@ -1397,7 +1432,7 @@ class Engine:
                 "margin": round(gap, 5),
                 "top2_margin": round(margin, 5),
                 "logits": scores,
-                "approximate": True,     # clean-cache reconstruction; see the docstring
+                "approximate": True,
             }
         except Exception as e:  # noqa: BLE001 — evidence is a bonus; never fail the race for it
             return {"margin": None, "is_tie": None, "margin_error": str(e)}
@@ -2758,6 +2793,35 @@ def make_handler(engine: Engine, api_key: str | None):
             messages = req.get("messages")
             if not isinstance(messages, list) or not messages:
                 return self._send_error(400, "'messages' must be a non-empty list")
+            has_image = any(
+                isinstance(m.get("content"), list)
+                and any(p.get("type") == "image_url" for p in m["content"])
+                for m in messages
+            )
+            if has_image:
+                if engine.vision is None:
+                    return self._send_error(400, "vision wiring is unavailable for this target")
+                try:
+                    if req.get("stream"):
+                        return self._send_error(
+                            400, "vision prototype currently requires stream=false")
+                    def _prepare_vision():
+                        armed = arm_messages(engine.vision, messages, engine.tokenizer)
+                        embeds, grid, _normalized, prompt_ids = armed
+                        arm_request(engine.vision, embeds, prompt_ids, grid)
+                        return prompt_ids
+                    # All MLX vision work must run on the same executor thread
+                    # as target generation; handler threads have no MLX stream.
+                    prompt_ids = engine._executor.submit(_prepare_vision).result()
+                    self._run(req, prompt_ids, chat=True, force_baseline=True)
+                except Exception as exc:
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
+                    disarm_request(engine.vision)
+                    return self._send_error(400, f"vision preprocessing failed: {exc}")
+                finally:
+                    disarm_request(engine.vision)
+                return
             # chat-template kwargs: server defaults, then per-request overrides. Supports the
             # common `chat_template_kwargs` extension and a top-level `enable_thinking` shortcut.
             tkw = {**engine.template_defaults, **(req.get("chat_template_kwargs") or {})}
@@ -3070,7 +3134,8 @@ def make_handler(engine: Engine, api_key: str | None):
                                                tool_calls=parsed):
                 self._sse(payload, name)
 
-        def _run(self, req: dict, prompt_ids: list[int], *, chat: bool):
+        def _run(self, req: dict, prompt_ids: list[int], *, chat: bool,
+                 force_baseline: bool = False):
             # request value > model's generation_config recommendation > library default —
             # explicit client settings always win; the model defaults only fill absences.
             temperature, top_p, top_k = _sampling(req, engine.sampling_defaults)
@@ -3106,7 +3171,8 @@ def make_handler(engine: Engine, api_key: str | None):
 
             if n == 1 or params["temperature"] == 0:
                 # greedy is deterministic: n identical choices from one generation
-                res_list = [engine.generate(prompt_ids, on_text=None, **params)] * n
+                res_list = [engine.generate(prompt_ids, on_text=None,
+                                             force_baseline=force_baseline, **params)] * n
                 gen_tokens = res_list[0].num_tokens
             else:
                 # sampled n-best: submit concurrently so a BatchEngine batches the rows
@@ -3115,7 +3181,8 @@ def make_handler(engine: Engine, api_key: str | None):
 
                 with _Pool(max_workers=n) as pool:
                     res_list = list(pool.map(
-                        lambda _i: engine.generate(prompt_ids, on_text=None, **params),
+                        lambda _i: engine.generate(prompt_ids, on_text=None,
+                                                   force_baseline=force_baseline, **params),
                         range(n)))
                 gen_tokens = sum(r.num_tokens for r in res_list)
             usage = {

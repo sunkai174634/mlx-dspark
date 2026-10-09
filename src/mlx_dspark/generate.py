@@ -516,6 +516,7 @@ def greedy_generate(
     on_prefill=None,
     prefill_marks=None,
     on_prefill_chunk=None,
+    on_prefill_done=None,
 ) -> GenResult:
     """Plain decoding of the target (no drafter, no hidden-state capture) — the fair
     'run the model normally' baseline. ``temperature`` 0 = greedy, > 0 = sampling (matches
@@ -543,6 +544,8 @@ def greedy_generate(
     if on_prefill is not None:
         on_prefill(cache, None, len(ids))   # caches hold exactly `ids` right now
     mx.eval(logits)                          # settle prompt-eval so the prefill/decode timing split is
+    if on_prefill_done is not None:
+        on_prefill_done()
     t_prefill = time.time()                  # honest (values are unchanged; this only fixes the clock)
     out_ids: list[int] = []
     pen = _Penalizer(presence_penalty, frequency_penalty)
